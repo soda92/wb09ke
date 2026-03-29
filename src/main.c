@@ -1,4 +1,4 @@
-/* src/main.c: HID Consumer Control for WB09 (Just Works + Bond Reset) */
+/* src/main.c: HID Consumer Control for WB09 with Debugging */
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -45,8 +45,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	LOG_INF("Connected to %s", addr);
 	current_conn = bt_conn_ref(conn);
 
-	/* Trigger 'Just Works' Pairing */
-	err = bt_conn_set_security(conn, BT_SECURITY_L2);
+	/* Trigger Authenticated Pairing immediately */
+	LOG_INF("Initiating security transition...");
+	err = bt_conn_set_security(conn, BT_SECURITY_L3);
 	if (err) {
 		LOG_ERR("Failed to set security (err %d)", err);
 	}
@@ -82,6 +83,25 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.security_changed = security_changed,
 };
 
+/* Authentication Callbacks */
+static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("##############################################");
+	LOG_INF("# Passkey for %s: %06u", addr, passkey);
+	LOG_INF("# PLEASE ENTER THIS PIN ON YOUR PHONE/PC");
+	LOG_INF("##############################################");
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("Pairing cancelled: %s", addr);
+}
+
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -95,6 +115,12 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	LOG_ERR("Pairing failed: %s, reason: %d", addr, reason);
 }
+
+static struct bt_conn_auth_cb auth_cb_display = {
+	.passkey_display = auth_passkey_display,
+	.passkey_entry = NULL,
+	.cancel = auth_cancel,
+};
 
 static struct bt_conn_auth_info_cb auth_cb_info = {
 	.pairing_complete = pairing_complete,
@@ -144,18 +170,19 @@ static void bt_ready(int err)
 void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	if (!current_conn) {
+		LOG_WRN("No connection, button press ignored");
 		return;
 	}
 
 	uint8_t report = 0;
 	if (pins & BIT(sw1.pin)) {
-		LOG_INF("Vol Up");
+		LOG_INF("Button 1 (Vol Up)");
 		report = CONSUMER_VOL_UP;
 	} else if (pins & BIT(sw2.pin)) {
-		LOG_INF("Vol Down");
+		LOG_INF("Button 2 (Vol Down)");
 		report = CONSUMER_VOL_DOWN;
 	} else if (pins & BIT(sw3.pin)) {
-		LOG_INF("Play/Pause");
+		LOG_INF("Button 3 (Play/Pause)");
 		report = CONSUMER_PLAY_PAUSE;
 	}
 
@@ -168,19 +195,12 @@ int main(void)
 {
 	int err;
 
-	LOG_INF("Starting HID Remote Control...");
+	LOG_INF("Starting HID Remote Control (PIN Approach with DBG)...");
 
 	/* Init Buttons */
 	gpio_pin_configure_dt(&sw1, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_configure_dt(&sw2, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_configure_dt(&sw3, GPIO_INPUT | GPIO_PULL_UP);
-
-	/* Check if SW1 is held during boot to clear bonds */
-	k_sleep(K_MSEC(100));
-	if (gpio_pin_get_dt(&sw1) == 0) { /* Active Low */
-		LOG_INF("SW1 held during boot, clearing all bonds...");
-		bt_unpair(BT_ID_DEFAULT, NULL);
-	}
 
 	gpio_pin_interrupt_configure_dt(&sw1, GPIO_INT_EDGE_TO_ACTIVE);
 	gpio_pin_interrupt_configure_dt(&sw2, GPIO_INT_EDGE_TO_ACTIVE);
@@ -194,7 +214,8 @@ int main(void)
 	gpio_add_callback(sw2.port, &sw2_cb_data);
 	gpio_add_callback(sw3.port, &sw3_cb_data);
 
-	/* Register Info Callbacks */
+	/* Register Auth Callbacks */
+	bt_conn_auth_cb_register(&auth_cb_display);
 	bt_conn_auth_info_cb_register(&auth_cb_info);
 
 	/* Initialize Bluetooth */
