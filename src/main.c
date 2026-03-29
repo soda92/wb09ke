@@ -45,6 +45,7 @@ struct k_work report_work;
 struct k_work pairing_start_work;
 struct k_work_delayable pairing_timeout_work;
 struct k_work_delayable blink_work;
+struct k_work_delayable led_success_work;
 
 /* Advertising Data */
 static const struct bt_data ad[] = {
@@ -58,7 +59,7 @@ static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
-/* LED Blinking */
+/* LED Blinking & Success indication */
 static void blink_work_handler(struct k_work *work)
 {
 	if (!is_pairing_mode) {
@@ -68,6 +69,13 @@ static void blink_work_handler(struct k_work *work)
 
 	gpio_pin_toggle_dt(&led);
 	k_work_schedule(&blink_work, BLINK_INTERVAL);
+}
+
+static void led_success_handler(struct k_work *work)
+{
+	gpio_pin_set_dt(&led, 1);
+	k_sleep(K_MSEC(1000));
+	gpio_pin_set_dt(&led, 0);
 }
 
 /* Pairing Mode Control */
@@ -148,7 +156,7 @@ void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t
 			}
 		}
 	} else if (pins & BIT(sw2.pin)) {
-		if (pressed) return; /* Only on release for simplicity */
+		if (pressed) return;
 		if (current_conn) {
 			pending_report = CONSUMER_VOL_DOWN;
 			k_work_submit(&report_work);
@@ -181,14 +189,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		is_pairing_mode = false;
 		k_work_cancel_delayable(&pairing_timeout_work);
 		k_work_cancel_delayable(&blink_work);
-		gpio_pin_set_dt(&led, 1); /* Steady ON for a bit to indicate success */
-		k_sleep(K_MSEC(1000));
-		gpio_pin_set_dt(&led, 0);
+		k_work_schedule(&led_success_work, K_NO_WAIT);
 	}
 	
-	/* Just Works pairing usually happens automatically if requested by host, 
-	 * but we can still request encryption here.
-	 */
+	/* Trigger security after connection */
 	bt_conn_set_security(conn, BT_SECURITY_L2);
 }
 
@@ -203,7 +207,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		current_conn = NULL;
 	}
 	
-	/* Stay idle after disconnect unless we were in pairing mode */
 	if (!is_pairing_mode) {
 		bt_le_adv_stop();
 	}
@@ -254,10 +257,8 @@ static void bt_ready(int err)
 		settings_load();
 	}
 
-	/* Disable bonding by default, only enable during pairing mode */
 	bt_set_bondable(false);
 
-	/* Start non-bondable advertising to allow reconnections from existing bonds */
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err) {
 		LOG_ERR("Initial advertising failed (err %d)", err);
@@ -274,6 +275,7 @@ int main(void)
 	k_work_init(&pairing_start_work, pairing_start_handler);
 	k_work_init_delayable(&pairing_timeout_work, stop_pairing_mode);
 	k_work_init_delayable(&blink_work, blink_work_handler);
+	k_work_init_delayable(&led_success_work, led_success_handler);
 
 	/* Init Buttons & LED */
 	gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
@@ -281,7 +283,6 @@ int main(void)
 	gpio_pin_configure_dt(&sw2, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_configure_dt(&sw3, GPIO_INPUT | GPIO_PULL_UP);
 
-	/* Configure interrupts for both edges to support long press */
 	gpio_pin_interrupt_configure_dt(&sw1, GPIO_INT_EDGE_BOTH);
 	gpio_pin_interrupt_configure_dt(&sw2, GPIO_INT_EDGE_TO_ACTIVE);
 	gpio_pin_interrupt_configure_dt(&sw3, GPIO_INT_EDGE_TO_ACTIVE);
