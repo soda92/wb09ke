@@ -1,4 +1,4 @@
-/* src/main.c: HID Consumer Control for WB09 with Debugging */
+/* src/main.c: HID Consumer Control for WB09 (Stable PIN) */
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -13,7 +13,7 @@
 
 #include "hog.h"
 
-LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* GPIO for Buttons */
 static const struct gpio_dt_spec sw1 = GPIO_DT_SPEC_GET(DT_NODELABEL(user_button_1), gpios);
@@ -24,12 +24,49 @@ static struct gpio_callback sw1_cb_data;
 static struct gpio_callback sw2_cb_data;
 static struct gpio_callback sw3_cb_data;
 
-/* Reports: 1 byte [VOL_UP, VOL_DOWN, PLAY_PAUSE, 5 bits padding] */
+/* Consumer Control Usage IDs */
 #define CONSUMER_VOL_UP     BIT(0)
 #define CONSUMER_VOL_DOWN   BIT(1)
 #define CONSUMER_PLAY_PAUSE BIT(2)
 
 static struct bt_conn *current_conn;
+static uint8_t pending_report;
+
+/* Work item to send reports (avoids k_sleep in ISR) */
+struct k_work report_work;
+
+static void report_work_handler(struct k_work *work)
+{
+	if (!current_conn) {
+		return;
+	}
+
+	uint8_t report = pending_report;
+	LOG_INF("Sending HID Report: 0x%02x", report);
+	
+	hog_send_report(current_conn, report);
+	k_sleep(K_MSEC(20));
+	hog_send_report(current_conn, 0);
+}
+
+void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	if (!current_conn) {
+		return;
+	}
+
+	if (pins & BIT(sw1.pin)) {
+		pending_report = CONSUMER_VOL_UP;
+	} else if (pins & BIT(sw2.pin)) {
+		pending_report = CONSUMER_VOL_DOWN;
+	} else if (pins & BIT(sw3.pin)) {
+		pending_report = CONSUMER_PLAY_PAUSE;
+	} else {
+		return;
+	}
+
+	k_work_submit(&report_work);
+}
 
 /* Bluetooth Connection Management */
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -45,8 +82,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	LOG_INF("Connected to %s", addr);
 	current_conn = bt_conn_ref(conn);
 
-	/* Trigger Authenticated Pairing immediately */
-	LOG_INF("Initiating security transition...");
+	/* Trigger security transition after a small delay to let service discovery start */
+	k_sleep(K_MSEC(500));
 	err = bt_conn_set_security(conn, BT_SECURITY_L3);
 	if (err) {
 		LOG_ERR("Failed to set security (err %d)", err);
@@ -67,13 +104,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
 	if (!err) {
-		LOG_INF("Security level changed: %s level %u", addr, level);
+		LOG_INF("Security level changed: level %u", level);
 	} else {
-		LOG_ERR("Security failed: %s level %u err %d", addr, level, err);
+		LOG_ERR("Security failed: level %u err %d", level, err);
 	}
 }
 
@@ -83,43 +117,28 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.security_changed = security_changed,
 };
 
-/* Authentication Callbacks */
 static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
 	LOG_INF("##############################################");
-	LOG_INF("# Passkey for %s: %06u", addr, passkey);
+	LOG_INF("# Passkey: %06u", passkey);
 	LOG_INF("# PLEASE ENTER THIS PIN ON YOUR PHONE/PC");
 	LOG_INF("##############################################");
 }
 
-static void auth_cancel(struct bt_conn *conn)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	LOG_INF("Pairing cancelled: %s", addr);
-}
-
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	LOG_INF("Pairing complete: %s, bonded: %s", addr, bonded ? "yes" : "no");
+	LOG_INF("Pairing complete, bonded: %s", bonded ? "yes" : "no");
 }
 
 static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	LOG_ERR("Pairing failed: %s, reason: %d", addr, reason);
+	LOG_ERR("Pairing failed (reason %d)", reason);
 }
 
 static struct bt_conn_auth_cb auth_cb_display = {
 	.passkey_display = auth_passkey_display,
 	.passkey_entry = NULL,
-	.cancel = auth_cancel,
+	.cancel = NULL,
 };
 
 static struct bt_conn_auth_info_cb auth_cb_info = {
@@ -150,9 +169,8 @@ static void bt_ready(int err)
 
 	hog_init();
 
-	if (IS_ENABLED(CONFIG_SETTINGS)) {
+	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
 		settings_load();
-		LOG_INF("Settings loaded");
 	}
 
 	bt_bas_set_battery_level(100);
@@ -166,36 +184,13 @@ static void bt_ready(int err)
 	LOG_INF("Advertising successfully started");
 }
 
-/* Button Handler */
-void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-	if (!current_conn) {
-		LOG_WRN("No connection, button press ignored");
-		return;
-	}
-
-	uint8_t report = 0;
-	if (pins & BIT(sw1.pin)) {
-		LOG_INF("Button 1 (Vol Up)");
-		report = CONSUMER_VOL_UP;
-	} else if (pins & BIT(sw2.pin)) {
-		LOG_INF("Button 2 (Vol Down)");
-		report = CONSUMER_VOL_DOWN;
-	} else if (pins & BIT(sw3.pin)) {
-		LOG_INF("Button 3 (Play/Pause)");
-		report = CONSUMER_PLAY_PAUSE;
-	}
-
-	if (report) {
-		hog_send_report(current_conn, report);
-	}
-}
-
 int main(void)
 {
 	int err;
 
-	LOG_INF("Starting HID Remote Control (PIN Approach with DBG)...");
+	LOG_INF("Starting HID Remote Control (PIN + Workqueue)...");
+
+	k_work_init(&report_work, report_work_handler);
 
 	/* Init Buttons */
 	gpio_pin_configure_dt(&sw1, GPIO_INPUT | GPIO_PULL_UP);
@@ -214,7 +209,6 @@ int main(void)
 	gpio_add_callback(sw2.port, &sw2_cb_data);
 	gpio_add_callback(sw3.port, &sw3_cb_data);
 
-	/* Register Auth Callbacks */
 	bt_conn_auth_cb_register(&auth_cb_display);
 	bt_conn_auth_info_cb_register(&auth_cb_info);
 
