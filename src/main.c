@@ -19,11 +19,13 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 static const struct gpio_dt_spec sw1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec sw2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
 static const struct gpio_dt_spec sw3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static const struct gpio_dt_spec sw4 = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
 static struct gpio_callback sw1_cb_data;
 static struct gpio_callback sw2_cb_data;
 static struct gpio_callback sw3_cb_data;
+static struct gpio_callback sw4_cb_data;
 
 /* Timing constants */
 #define PAIRING_MODE_DURATION K_MINUTES(2)
@@ -31,10 +33,12 @@ static struct gpio_callback sw3_cb_data;
 #define BLINK_INTERVAL K_MSEC(300)
 #define DEBOUNCE_INTERVAL 50 /* ms */
 
-/* Consumer Control Usage IDs */
+/* Consumer Control Usage IDs - Matched to report_map in hog.c */
 #define CONSUMER_VOL_UP     BIT(0)
 #define CONSUMER_VOL_DOWN   BIT(1)
 #define CONSUMER_PLAY_PAUSE BIT(2)
+#define CONSUMER_SCAN_NEXT  BIT(3)
+#define CONSUMER_SCAN_PREV  BIT(4)
 
 static struct bt_conn *current_conn;
 static uint8_t pending_report;
@@ -42,6 +46,7 @@ static bool is_pairing_mode = false;
 static int64_t sw1_press_time;
 static int64_t sw2_last_time;
 static int64_t sw3_last_time;
+static int64_t sw4_last_time;
 
 /* Work items */
 struct k_work report_work;
@@ -188,6 +193,15 @@ void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t
 			pending_report = CONSUMER_PLAY_PAUSE;
 			k_work_submit(&report_work);
 		}
+	} else if (pins & BIT(sw4.pin)) {
+		/* Debounce Prev Song */
+		if (now - sw4_last_time < DEBOUNCE_INTERVAL) return;
+		sw4_last_time = now;
+
+		if (current_conn) {
+			pending_report = CONSUMER_SCAN_PREV;
+			k_work_submit(&report_work);
+		}
 	}
 }
 
@@ -305,18 +319,22 @@ int main(void)
 	gpio_pin_configure_dt(&sw1, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_configure_dt(&sw2, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_configure_dt(&sw3, GPIO_INPUT | GPIO_PULL_UP);
+	gpio_pin_configure_dt(&sw4, GPIO_INPUT | GPIO_PULL_UP);
 
 	gpio_pin_interrupt_configure_dt(&sw1, GPIO_INT_EDGE_BOTH);
 	gpio_pin_interrupt_configure_dt(&sw2, GPIO_INT_EDGE_TO_ACTIVE);
 	gpio_pin_interrupt_configure_dt(&sw3, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_pin_interrupt_configure_dt(&sw4, GPIO_INT_EDGE_TO_ACTIVE);
 
 	gpio_init_callback(&sw1_cb_data, button_pressed, BIT(sw1.pin));
 	gpio_init_callback(&sw2_cb_data, button_pressed, BIT(sw2.pin));
 	gpio_init_callback(&sw3_cb_data, button_pressed, BIT(sw3.pin));
+	gpio_init_callback(&sw4_cb_data, button_pressed, BIT(sw4.pin));
 
 	gpio_add_callback(sw1.port, &sw1_cb_data);
 	gpio_add_callback(sw2.port, &sw2_cb_data);
 	gpio_add_callback(sw3.port, &sw3_cb_data);
+	gpio_add_callback(sw4.port, &sw4_cb_data);
 
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_subsys_init();

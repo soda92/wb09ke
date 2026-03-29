@@ -63,12 +63,14 @@ static const uint8_t report_map[] = {
 	0x15, 0x00, /* Logical Minimum (0) */
 	0x25, 0x01, /* Logical Maximum (1) */
 	0x75, 0x01, /* Report Size (1) */
-	0x95, 0x03, /* Report Count (3) */
+	0x95, 0x05, /* Report Count (5) */
 	0x09, 0xe9, /* Usage (Volume Up) */
 	0x09, 0xea, /* Usage (Volume Down) */
 	0x09, 0xcd, /* Usage (Play/Pause) */
+	0x09, 0xb5, /* Usage (Scan Next Track) */
+	0x09, 0xb6, /* Usage (Scan Previous Track) */
 	0x81, 0x02, /* Input (Data, Variable, Absolute) */
-	0x95, 0x05, /* Report Count (5) - Padding */
+	0x95, 0x03, /* Report Count (3) - Padding */
 	0x81, 0x01, /* Input (Constant) */
 	0xc0        /* End Collection */
 };
