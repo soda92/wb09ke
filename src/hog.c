@@ -139,6 +139,7 @@ BT_GATT_SERVICE_DEFINE(hog_svc,
 			       read_report, NULL, &report_val),
 	BT_GATT_CCC(input_report_ccc_changed,
 		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_AUTHEN),
+
 	BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ,
 			   read_report_ref, NULL, &input_report),
 	BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_CTRL_POINT,
