@@ -42,6 +42,7 @@ static int64_t sw1_press_time;
 
 /* Work items */
 struct k_work report_work;
+struct k_work pairing_start_work;
 struct k_work_delayable pairing_timeout_work;
 struct k_work_delayable blink_work;
 
@@ -70,7 +71,7 @@ static void blink_work_handler(struct k_work *work)
 }
 
 /* Pairing Mode Control */
-static void start_pairing_mode(void)
+static void pairing_start_handler(struct k_work *work)
 {
 	LOG_INF("Entering Pairing Mode (Just Works)...");
 	
@@ -136,7 +137,7 @@ void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t
 			/* Released */
 			int64_t duration = k_uptime_get() - sw1_press_time;
 			if (duration >= k_ticks_to_ms_near64(LONG_PRESS_THRESHOLD.ticks)) {
-				start_pairing_mode();
+				k_work_submit(&pairing_start_work);
 				return;
 			}
 			
@@ -270,6 +271,7 @@ int main(void)
 	LOG_INF("Starting HID Remote Control with Pairing Mode...");
 
 	k_work_init(&report_work, report_work_handler);
+	k_work_init(&pairing_start_work, pairing_start_handler);
 	k_work_init_delayable(&pairing_timeout_work, stop_pairing_mode);
 	k_work_init_delayable(&blink_work, blink_work_handler);
 
