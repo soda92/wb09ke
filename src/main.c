@@ -32,8 +32,22 @@ static struct gpio_callback sw3_cb_data;
 static struct bt_conn *current_conn;
 static uint8_t pending_report;
 
-/* Work item to send reports (avoids k_sleep in ISR) */
+/* Work items to avoid blocking ISR/System Workqueue */
 struct k_work report_work;
+struct k_work_delayable security_work;
+
+static void security_work_handler(struct k_work *work)
+{
+	if (!current_conn) {
+		return;
+	}
+
+	LOG_INF("Triggering security transition...");
+	int err = bt_conn_set_security(current_conn, BT_SECURITY_L3);
+	if (err) {
+		LOG_ERR("Failed to set security (err %d)", err);
+	}
+}
 
 static void report_work_handler(struct k_work *work)
 {
@@ -82,12 +96,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	LOG_INF("Connected to %s", addr);
 	current_conn = bt_conn_ref(conn);
 
-	/* Trigger security transition after a small delay to let service discovery start */
-	k_sleep(K_MSEC(500));
-	err = bt_conn_set_security(conn, BT_SECURITY_L3);
-	if (err) {
-		LOG_ERR("Failed to set security (err %d)", err);
-	}
+	/* Delay security request to allow initial GATT procedures */
+	k_work_schedule(&security_work, K_MSEC(1000));
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -170,7 +180,17 @@ static void bt_ready(int err)
 	hog_init();
 
 	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
-		settings_load();
+		err = settings_load();
+		if (err) {
+			LOG_ERR("Settings load failed (err %d)", err);
+		} else {
+			LOG_INF("Settings loaded successfully");
+		}
+	}
+
+	/* Set fixed passkey if configured */
+	if (IS_ENABLED(CONFIG_BT_FIXED_PASSKEY)) {
+		bt_passkey_set(123456);
 	}
 
 	bt_bas_set_battery_level(100);
@@ -188,9 +208,10 @@ int main(void)
 {
 	int err;
 
-	LOG_INF("Starting HID Remote Control (PIN + Workqueue)...");
+	LOG_INF("Starting HID Remote Control...");
 
 	k_work_init(&report_work, report_work_handler);
+	k_work_init_delayable(&security_work, security_work_handler);
 
 	/* Init Buttons */
 	gpio_pin_configure_dt(&sw1, GPIO_INPUT | GPIO_PULL_UP);
@@ -208,6 +229,14 @@ int main(void)
 	gpio_add_callback(sw1.port, &sw1_cb_data);
 	gpio_add_callback(sw2.port, &sw2_cb_data);
 	gpio_add_callback(sw3.port, &sw3_cb_data);
+
+	/* Initialize Settings Subsystem */
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		err = settings_subsys_init();
+		if (err) {
+			LOG_ERR("Settings subsys init failed (err %d)", err);
+		}
+	}
 
 	bt_conn_auth_cb_register(&auth_cb_display);
 	bt_conn_auth_info_cb_register(&auth_cb_info);
