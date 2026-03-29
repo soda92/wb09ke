@@ -15,14 +15,18 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-/* GPIO for Buttons */
+/* GPIO for Buttons & LED */
 static const struct gpio_dt_spec sw1 = GPIO_DT_SPEC_GET(DT_NODELABEL(user_button_1), gpios);
 static const struct gpio_dt_spec sw2 = GPIO_DT_SPEC_GET(DT_NODELABEL(user_button_2), gpios);
 static const struct gpio_dt_spec sw3 = GPIO_DT_SPEC_GET(DT_NODELABEL(user_button_3), gpios);
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
 static struct gpio_callback sw1_cb_data;
 static struct gpio_callback sw2_cb_data;
 static struct gpio_callback sw3_cb_data;
+
+/* Timing constants */
+#define LONG_PRESS_THRESHOLD K_SECONDS(3)
 
 /* Consumer Control Usage IDs */
 #define CONSUMER_VOL_UP     BIT(0)
@@ -31,24 +35,61 @@ static struct gpio_callback sw3_cb_data;
 
 static struct bt_conn *current_conn;
 static uint8_t pending_report;
+static int64_t sw1_press_time;
 
-/* Work items to avoid blocking ISR/System Workqueue */
+/* Work items */
 struct k_work report_work;
-struct k_work_delayable security_work;
+struct k_work unpair_work;
+struct k_work_delayable led_success_work;
 
-static void security_work_handler(struct k_work *work)
+/* Advertising Data */
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_UUID16_ALL,
+		      BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL),
+		      BT_UUID_16_ENCODE(BT_UUID_BAS_VAL)),
+};
+
+static const struct bt_data sd[] = {
+	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+
+/* LED Success indication */
+static void led_success_handler(struct k_work *work)
 {
-	if (!current_conn) {
-		return;
-	}
-
-	LOG_INF("Triggering security transition...");
-	int err = bt_conn_set_security(current_conn, BT_SECURITY_L3);
-	if (err) {
-		LOG_ERR("Failed to set security (err %d)", err);
-	}
+	gpio_pin_set_dt(&led, 1);
+	k_sleep(K_MSEC(1000));
+	gpio_pin_set_dt(&led, 0);
 }
 
+/* Unpair and reset advertising */
+static void unpair_handler(struct k_work *work)
+{
+	LOG_INF("Long press detected: Clearing all bonds and restarting advertising...");
+	
+	bt_le_adv_stop();
+
+	if (current_conn) {
+		bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+	}
+
+	/* Clear all existing bonds */
+	bt_unpair(BT_ID_DEFAULT, NULL);
+
+	/* Flash LED to indicate clear */
+	for (int i = 0; i < 3; i++) {
+		gpio_pin_set_dt(&led, 1);
+		k_sleep(K_MSEC(100));
+		gpio_pin_set_dt(&led, 0);
+		k_sleep(K_MSEC(100));
+	}
+
+	k_sleep(K_MSEC(100));
+	bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	LOG_INF("Bonds cleared. Ready for fresh pairing with PIN 123456.");
+}
+
+/* Report work */
 static void report_work_handler(struct k_work *work)
 {
 	if (!current_conn) {
@@ -63,23 +104,41 @@ static void report_work_handler(struct k_work *work)
 	hog_send_report(current_conn, 0);
 }
 
+/* Button Handler */
 void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-	if (!current_conn) {
-		return;
-	}
+	bool pressed = gpio_pin_get_dt(&sw1) > 0;
 
 	if (pins & BIT(sw1.pin)) {
-		pending_report = CONSUMER_VOL_UP;
+		if (pressed) {
+			sw1_press_time = k_uptime_get();
+		} else {
+			/* Released */
+			int64_t duration = k_uptime_get() - sw1_press_time;
+			if (duration >= k_ticks_to_ms_near64(LONG_PRESS_THRESHOLD.ticks)) {
+				k_work_submit(&unpair_work);
+				return;
+			}
+			
+			/* Normal SW1 action (Vol Up) */
+			if (current_conn) {
+				pending_report = CONSUMER_VOL_UP;
+				k_work_submit(&report_work);
+			}
+		}
 	} else if (pins & BIT(sw2.pin)) {
-		pending_report = CONSUMER_VOL_DOWN;
+		if (pressed) return;
+		if (current_conn) {
+			pending_report = CONSUMER_VOL_DOWN;
+			k_work_submit(&report_work);
+		}
 	} else if (pins & BIT(sw3.pin)) {
-		pending_report = CONSUMER_PLAY_PAUSE;
-	} else {
-		return;
+		if (pressed) return;
+		if (current_conn) {
+			pending_report = CONSUMER_PLAY_PAUSE;
+			k_work_submit(&report_work);
+		}
 	}
-
-	k_work_submit(&report_work);
 }
 
 /* Bluetooth Connection Management */
@@ -96,8 +155,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	LOG_INF("Connected to %s", addr);
 	current_conn = bt_conn_ref(conn);
 
-	/* Delay security request to allow initial GATT procedures */
-	k_work_schedule(&security_work, K_MSEC(1000));
+	/* We DON'T trigger security transition manually here.
+	 * The Phone/PC will initiate pairing when it tries to read the HID characteristics.
+	 */
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -116,6 +176,9 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
 {
 	if (!err) {
 		LOG_INF("Security level changed: level %u", level);
+		if (level >= BT_SECURITY_L3) {
+			k_work_schedule(&led_success_work, K_NO_WAIT);
+		}
 	} else {
 		LOG_ERR("Security failed: level %u err %d", level, err);
 	}
@@ -156,18 +219,6 @@ static struct bt_conn_auth_info_cb auth_cb_info = {
 	.pairing_failed = pairing_failed,
 };
 
-/* HID Adv Data */
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL,
-		      BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL),
-		      BT_UUID_16_ENCODE(BT_UUID_BAS_VAL)),
-};
-
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-};
-
 static void bt_ready(int err)
 {
 	if (err) {
@@ -188,10 +239,8 @@ static void bt_ready(int err)
 		}
 	}
 
-	/* Set fixed passkey if configured */
-	if (IS_ENABLED(CONFIG_BT_FIXED_PASSKEY)) {
-		bt_passkey_set(123456);
-	}
+	/* Set fixed passkey */
+	bt_passkey_set(123456);
 
 	bt_bas_set_battery_level(100);
 
@@ -206,19 +255,19 @@ static void bt_ready(int err)
 
 int main(void)
 {
-	int err;
-
-	LOG_INF("Starting HID Remote Control...");
+	LOG_INF("Starting HID Remote Control (Fixed PIN)...");
 
 	k_work_init(&report_work, report_work_handler);
-	k_work_init_delayable(&security_work, security_work_handler);
+	k_work_init(&unpair_work, unpair_handler);
+	k_work_init_delayable(&led_success_work, led_success_handler);
 
-	/* Init Buttons */
+	/* Init Buttons & LED */
+	gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
 	gpio_pin_configure_dt(&sw1, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_configure_dt(&sw2, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_configure_dt(&sw3, GPIO_INPUT | GPIO_PULL_UP);
 
-	gpio_pin_interrupt_configure_dt(&sw1, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_pin_interrupt_configure_dt(&sw1, GPIO_INT_EDGE_BOTH);
 	gpio_pin_interrupt_configure_dt(&sw2, GPIO_INT_EDGE_TO_ACTIVE);
 	gpio_pin_interrupt_configure_dt(&sw3, GPIO_INT_EDGE_TO_ACTIVE);
 
@@ -232,20 +281,14 @@ int main(void)
 
 	/* Initialize Settings Subsystem */
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
-		err = settings_subsys_init();
-		if (err) {
-			LOG_ERR("Settings subsys init failed (err %d)", err);
-		}
+		settings_subsys_init();
 	}
 
 	bt_conn_auth_cb_register(&auth_cb_display);
 	bt_conn_auth_info_cb_register(&auth_cb_info);
 
 	/* Initialize Bluetooth */
-	err = bt_enable(bt_ready);
-	if (err) {
-		LOG_ERR("Bluetooth init failed (err %d)", err);
-	}
+	bt_enable(bt_ready);
 
 	return 0;
 }
