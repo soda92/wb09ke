@@ -29,7 +29,6 @@ static struct gpio_callback sw3_cb_data;
 #define PAIRING_MODE_DURATION K_MINUTES(2)
 #define LONG_PRESS_THRESHOLD K_SECONDS(3)
 #define BLINK_INTERVAL K_MSEC(300)
-#define SECURITY_DELAY K_MSEC(1000)
 
 /* Consumer Control Usage IDs */
 #define CONSUMER_VOL_UP     BIT(0)
@@ -47,7 +46,6 @@ struct k_work pairing_start_work;
 struct k_work_delayable pairing_timeout_work;
 struct k_work_delayable blink_work;
 struct k_work_delayable led_success_work;
-struct k_work_delayable security_req_work;
 
 /* Advertising Data */
 static const struct bt_data ad[] = {
@@ -83,22 +81,38 @@ static void led_success_handler(struct k_work *work)
 /* Pairing Mode Control */
 static void pairing_start_handler(struct k_work *work)
 {
+	int err;
+
 	LOG_INF("Entering Pairing Mode (Just Works)...");
 	
+	is_pairing_mode = true;
+
 	/* Stop any existing advertising */
 	bt_le_adv_stop();
+
+	/* Disconnect if connected to allow fresh pairing */
+	if (current_conn) {
+		bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+	}
+
+	/* Clear all existing bonds to avoid key mismatches */
+	LOG_INF("Clearing all existing bonds...");
+	bt_unpair(BT_ID_DEFAULT, NULL);
 
 	/* Enable bonding for new devices */
 	bt_set_bondable(true);
 
+	/* Tiny delay to allow controller to catch up */
+	k_sleep(K_MSEC(100));
+
 	/* Start fast advertising */
-	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err) {
 		LOG_ERR("Advertising failed to start (err %d)", err);
+		is_pairing_mode = false;
 		return;
 	}
 
-	is_pairing_mode = true;
 	k_work_schedule(&blink_work, K_NO_WAIT);
 	k_work_schedule(&pairing_timeout_work, PAIRING_MODE_DURATION);
 }
@@ -118,20 +132,6 @@ static void stop_pairing_mode(struct k_work *work)
 	}
 	
 	gpio_pin_set_dt(&led, 0);
-}
-
-/* Security Request */
-static void security_req_handler(struct k_work *work)
-{
-	if (!current_conn) {
-		return;
-	}
-
-	LOG_INF("Triggering security transition...");
-	int err = bt_conn_set_security(current_conn, BT_SECURITY_L2);
-	if (err) {
-		LOG_ERR("Failed to set security (err %d)", err);
-	}
 }
 
 /* Report work */
@@ -207,9 +207,6 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		k_work_cancel_delayable(&blink_work);
 		k_work_schedule(&led_success_work, K_NO_WAIT);
 	}
-	
-	/* Delay security request to allow initial GATT procedures */
-	k_work_schedule(&security_req_work, SECURITY_DELAY);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -292,7 +289,6 @@ int main(void)
 	k_work_init_delayable(&pairing_timeout_work, stop_pairing_mode);
 	k_work_init_delayable(&blink_work, blink_work_handler);
 	k_work_init_delayable(&led_success_work, led_success_handler);
-	k_work_init_delayable(&security_req_work, security_req_handler);
 
 	/* Init Buttons & LED */
 	gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
@@ -316,8 +312,11 @@ int main(void)
 		settings_subsys_init();
 	}
 
+	/* No auth callbacks needed for Just Works; it defaults to NoInputNoOutput */
 	bt_conn_auth_info_cb_register(&auth_cb_info);
+	
 	bt_enable(bt_ready);
 
 	return 0;
 }
+		
