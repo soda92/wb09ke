@@ -1,4 +1,4 @@
-/* src/main.c: HID Consumer Control for WB09 (Stable PIN) */
+/* src/main.c: HID Consumer Control (Board Agnostic) */
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -15,10 +15,10 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-/* GPIO for Buttons & LED */
-static const struct gpio_dt_spec sw1 = GPIO_DT_SPEC_GET(DT_NODELABEL(user_button_1), gpios);
-static const struct gpio_dt_spec sw2 = GPIO_DT_SPEC_GET(DT_NODELABEL(user_button_2), gpios);
-static const struct gpio_dt_spec sw3 = GPIO_DT_SPEC_GET(DT_NODELABEL(user_button_3), gpios);
+/* GPIO for Buttons & LED using standard aliases */
+static const struct gpio_dt_spec sw1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const struct gpio_dt_spec sw2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static const struct gpio_dt_spec sw3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
 static struct gpio_callback sw1_cb_data;
@@ -71,9 +71,9 @@ static void unpair_handler(struct k_work *work)
 
 	if (current_conn) {
 		bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		k_sleep(K_MSEC(500));
 	}
 
-	/* Clear all existing bonds */
 	bt_unpair(BT_ID_DEFAULT, NULL);
 
 	/* Flash LED to indicate clear */
@@ -84,7 +84,7 @@ static void unpair_handler(struct k_work *work)
 		k_sleep(K_MSEC(100));
 	}
 
-	k_sleep(K_MSEC(100));
+	k_sleep(K_MSEC(500));
 	bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	LOG_INF("Bonds cleared. Ready for fresh pairing with PIN 123456.");
 }
@@ -154,10 +154,6 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	LOG_INF("Connected to %s", addr);
 	current_conn = bt_conn_ref(conn);
-
-	/* We DON'T trigger security transition manually here.
-	 * The Phone/PC will initiate pairing when it tries to read the HID characteristics.
-	 */
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
