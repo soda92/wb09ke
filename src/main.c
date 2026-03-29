@@ -29,6 +29,7 @@ static struct gpio_callback sw3_cb_data;
 #define PAIRING_MODE_DURATION K_MINUTES(2)
 #define LONG_PRESS_THRESHOLD K_SECONDS(3)
 #define BLINK_INTERVAL K_MSEC(300)
+#define DEBOUNCE_INTERVAL 50 /* ms */
 
 /* Consumer Control Usage IDs */
 #define CONSUMER_VOL_UP     BIT(0)
@@ -39,6 +40,8 @@ static struct bt_conn *current_conn;
 static uint8_t pending_report;
 static bool is_pairing_mode = false;
 static int64_t sw1_press_time;
+static int64_t sw2_last_time;
+static int64_t sw3_last_time;
 
 /* Work items */
 struct k_work report_work;
@@ -143,33 +146,44 @@ static void report_work_handler(struct k_work *work)
 /* Button Handler */
 void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-	bool pressed = gpio_pin_get_dt(&sw1) > 0;
+	int64_t now = k_uptime_get();
 
 	if (pins & BIT(sw1.pin)) {
+		bool pressed = gpio_pin_get_dt(&sw1) > 0;
 		if (pressed) {
-			sw1_press_time = k_uptime_get();
+			sw1_press_time = now;
 		} else {
 			/* Released */
-			int64_t duration = k_uptime_get() - sw1_press_time;
+			int64_t duration = now - sw1_press_time;
 			if (duration >= k_ticks_to_ms_near64(LONG_PRESS_THRESHOLD.ticks)) {
 				k_work_submit(&unpair_work);
 				return;
 			}
 			
-			/* Normal SW1 action (Vol Up) */
+			/* Normal SW1 action (Vol Up) with debounce check */
+			static int64_t sw1_last_release;
+			if (now - sw1_last_release < DEBOUNCE_INTERVAL) return;
+			sw1_last_release = now;
+
 			if (current_conn) {
 				pending_report = CONSUMER_VOL_UP;
 				k_work_submit(&report_work);
 			}
 		}
 	} else if (pins & BIT(sw2.pin)) {
-		if (pressed) return;
+		/* Debounce Vol Down */
+		if (now - sw2_last_time < DEBOUNCE_INTERVAL) return;
+		sw2_last_time = now;
+
 		if (current_conn) {
 			pending_report = CONSUMER_VOL_DOWN;
 			k_work_submit(&report_work);
 		}
 	} else if (pins & BIT(sw3.pin)) {
-		if (pressed) return;
+		/* Debounce Play/Pause */
+		if (now - sw3_last_time < DEBOUNCE_INTERVAL) return;
+		sw3_last_time = now;
+
 		if (current_conn) {
 			pending_report = CONSUMER_PLAY_PAUSE;
 			k_work_submit(&report_work);
@@ -304,7 +318,6 @@ int main(void)
 	gpio_add_callback(sw2.port, &sw2_cb_data);
 	gpio_add_callback(sw3.port, &sw3_cb_data);
 
-	/* Initialize Settings Subsystem */
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_subsys_init();
 	}
