@@ -29,6 +29,7 @@ static struct gpio_callback sw3_cb_data;
 #define PAIRING_MODE_DURATION K_MINUTES(2)
 #define LONG_PRESS_THRESHOLD K_SECONDS(3)
 #define BLINK_INTERVAL K_MSEC(300)
+#define SECURITY_DELAY K_MSEC(1000)
 
 /* Consumer Control Usage IDs */
 #define CONSUMER_VOL_UP     BIT(0)
@@ -46,6 +47,7 @@ struct k_work pairing_start_work;
 struct k_work_delayable pairing_timeout_work;
 struct k_work_delayable blink_work;
 struct k_work_delayable led_success_work;
+struct k_work_delayable security_req_work;
 
 /* Advertising Data */
 static const struct bt_data ad[] = {
@@ -116,6 +118,20 @@ static void stop_pairing_mode(struct k_work *work)
 	}
 	
 	gpio_pin_set_dt(&led, 0);
+}
+
+/* Security Request */
+static void security_req_handler(struct k_work *work)
+{
+	if (!current_conn) {
+		return;
+	}
+
+	LOG_INF("Triggering security transition...");
+	int err = bt_conn_set_security(current_conn, BT_SECURITY_L2);
+	if (err) {
+		LOG_ERR("Failed to set security (err %d)", err);
+	}
 }
 
 /* Report work */
@@ -192,8 +208,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		k_work_schedule(&led_success_work, K_NO_WAIT);
 	}
 	
-	/* Trigger security after connection */
-	bt_conn_set_security(conn, BT_SECURITY_L2);
+	/* Delay security request to allow initial GATT procedures */
+	k_work_schedule(&security_req_work, SECURITY_DELAY);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -276,6 +292,7 @@ int main(void)
 	k_work_init_delayable(&pairing_timeout_work, stop_pairing_mode);
 	k_work_init_delayable(&blink_work, blink_work_handler);
 	k_work_init_delayable(&led_success_work, led_success_handler);
+	k_work_init_delayable(&security_req_work, security_req_handler);
 
 	/* Init Buttons & LED */
 	gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
